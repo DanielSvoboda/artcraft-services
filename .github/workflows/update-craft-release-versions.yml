@@ -1,4 +1,3 @@
-
 name: Update Craft Release Versions
 
 on:
@@ -23,7 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Check latest tags and update versions
+      - name: Check latest releases and update versions
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -51,11 +50,41 @@ jobs:
 
             const launcher = {
               repo: "craft-launcher",
-              key: "CRAFT_LAUNCHER_RELEASE",
+              fileSlug: "artcraft-launcher",
             };
 
+            // Pin a repository here to preserve an intentional rollback.
+            // Example: photocraft: "0.8.0"
+            // Remove the pin to resume automatic updates.
+            const pinnedVersions = {};
+
+            let content = fs.readFileSync(file, "utf8");
+
+            const assetsMatch = content.match(
+              /export const CRAFT_RELEASE_ASSETS:[\s\S]*?=\s*\[([\s\S]*?)\n\];/
+            );
+
+            if (!assetsMatch) {
+              throw new Error(
+                "Could not read required assets from the release catalog."
+              );
+            }
+
+            const assetTemplates = [
+              ...assetsMatch[1].matchAll(/\bfile:\s*"([^"]+)"/g),
+            ].map(match => match[1]);
+
+            if (assetTemplates.length === 0) {
+              throw new Error(
+                "No required release assets found in the catalog."
+              );
+            }
+
             function parseVersion(tag) {
-              const match = tag.match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+              const match = tag.match(
+                /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
+              );
+
               if (!match) return null;
 
               return {
@@ -73,9 +102,37 @@ jobs:
               return 0;
             }
 
-            async function latestVersion(repo) {
-              const tags = await github.paginate(
-                github.rest.repos.listTags,
+            function validateReleaseAssets(repo, fileSlug, release) {
+              const requiredAssets = assetTemplates
+                .filter(
+                  asset =>
+                    repo !== launcher.repo ||
+                    !asset.startsWith("{slug}-cli-")
+                )
+                .map(asset =>
+                  asset
+                    .replaceAll("{slug}", fileSlug)
+                    .replaceAll("{version}", release.text)
+                );
+
+              const publishedAssets = new Set(
+                release.assets.map(asset => asset.name)
+              );
+
+              const missingAssets = requiredAssets.filter(
+                asset => !publishedAssets.has(asset)
+              );
+
+              if (missingAssets.length > 0) {
+                throw new Error(
+                  `Release ${owner}/${repo}@${release.tag} is missing required assets: ${missingAssets.join(", ")}`
+                );
+              }
+            }
+
+            async function latestVersion(repo, fileSlug = repo) {
+              const releases = await github.paginate(
+                github.rest.repos.listReleases,
                 {
                   owner,
                   repo,
@@ -83,47 +140,86 @@ jobs:
                 }
               );
 
-              const versions = tags
-                .map(tag => parseVersion(tag.name))
+              const versions = releases
+                .filter(
+                  release => !release.draft && !release.prerelease
+                )
+                .map(release => {
+                  const parsed = parseVersion(release.tag_name);
+                  if (!parsed) return null;
+
+                  return {
+                    ...parsed,
+                    tag: release.tag_name,
+                    assets: release.assets || [],
+                  };
+                })
                 .filter(Boolean)
                 .sort(compareVersions);
 
-              if (versions.length === 0) {
+              const pinnedVersion = pinnedVersions[repo];
+
+              const selected = pinnedVersion
+                ? versions.find(
+                    version => version.text === pinnedVersion
+                  )
+                : versions[versions.length - 1];
+
+              if (!selected) {
+                if (pinnedVersion) {
+                  throw new Error(
+                    `Pinned stable release v${pinnedVersion} not found for ${owner}/${repo}.`
+                  );
+                }
+
                 throw new Error(
-                  `No stable X.Y.Z version tags found for ${owner}/${repo}`
+                  `No published stable vX.Y.Z releases found for ${owner}/${repo}.`
                 );
               }
 
-              const latest = versions[versions.length - 1];
+              validateReleaseAssets(repo, fileSlug, selected);
 
-              core.info(`${repo}: ${latest.text}`);
-              return latest.text;
+              core.info(`${repo}: ${selected.text} (${selected.tag})`);
+              return selected.text;
             }
 
-            let content = fs.readFileSync(file, "utf8");
-
             // Update the launcher version.
-            const launcherVersion = await latestVersion(launcher.repo);
+            const launcherDisabledPattern =
+              /export const CRAFT_LAUNCHER_RELEASE:[\s\S]*?=\s*null\s*;/;
 
             const launcherPattern =
               /(export const CRAFT_LAUNCHER_RELEASE:[\s\S]*?=\s*craftRelease\(\s*)"[^"]+"/;
 
-            if (!launcherPattern.test(content)) {
-              throw new Error("Could not find the launcher version.");
+            if (launcherDisabledPattern.test(content)) {
+              core.info(
+                "craft-launcher: release disabled in catalog; preserving null."
+              );
+            } else {
+              if (!launcherPattern.test(content)) {
+                throw new Error("Could not find the launcher version.");
+              }
+
+              const launcherVersion = await latestVersion(
+                launcher.repo,
+                launcher.fileSlug
+              );
+
+              content = content.replace(
+                launcherPattern,
+                (_, prefix) => `${prefix}"${launcherVersion}"`
+              );
             }
 
-            content = content.replace(
-              launcherPattern,
-              (_, prefix) => `${prefix}"${launcherVersion}"`
-            );
-
-            // Update each app version.
+            // Update each enabled app version.
             for (const app of apps) {
-              const version = await latestVersion(app);
-
               const escaped = app.replace(
                 /[.*+?^${}()|[\]\\]/g,
                 "\\$&"
+              );
+
+              const disabledPattern = new RegExp(
+                `(^\\s*${escaped}:\\s*)null\\s*,`,
+                "m"
               );
 
               const pattern = new RegExp(
@@ -131,11 +227,20 @@ jobs:
                 "m"
               );
 
+              if (disabledPattern.test(content)) {
+                core.info(
+                  `${app}: release disabled in catalog; preserving null.`
+                );
+                continue;
+              }
+
               if (!pattern.test(content)) {
                 throw new Error(
                   `Could not find the release entry for ${app}.`
                 );
               }
+
+              const version = await latestVersion(app);
 
               content = content.replace(
                 pattern,
@@ -159,13 +264,16 @@ jobs:
             ## Summary
 
             Automatically synchronize the Craft Launcher and Crafting Apps
-            versions with the latest stable semantic-version tags in their
+            versions with the latest stable published releases in their
             respective GitHub repositories.
 
             ## Changes
 
-            - Update the launcher version.
-            - Update all Crafting Apps release versions.
+            - Update versions from published stable releases only.
+            - Ignore prereleases, drafts, and tags outside vX.Y.Z.
+            - Validate all required release assets before updating the catalog.
+            - Preserve catalog entries explicitly set to null.
+            - Support pinned versions for intentional rollbacks.
             - Keep the existing release asset configuration unchanged.
 
             Generated by the `Update Craft Release Versions` workflow.
