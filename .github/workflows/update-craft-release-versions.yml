@@ -3,8 +3,8 @@ name: Update Craft Release Versions
 
 on:
   schedule:
-    # Every Monday at 08:00 UTC
-    - cron: "0 8 * * 1"
+    # Every day at 08:00 UTC
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 permissions:
